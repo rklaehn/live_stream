@@ -42,8 +42,9 @@ use futures::prelude::*;
 use std::{
     fmt::Debug,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll}, sync::{Mutex, Arc},
 };
+use future::{LocalBoxFuture, BoxFuture};
 
 /// A stream that is built from a piece of data an a function that takes a reference to said data
 pub struct LiveStream<D, S> {
@@ -147,5 +148,131 @@ mod tests {
         let q = Query;
         let res = db.query_static(q).collect::<Vec<_>>().await;
         assert_eq!(res, vec!["1", "2", "3"]);
+    }
+
+    fn foo2(arg: u64) -> impl Stream<Item = u64> {
+        let target: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let target2 = target.clone();
+        let mut fut = async move {
+            let mut arg = arg;
+            let mut stream = stream_to_10(&mut arg);
+            while let Some(item) = stream.next().await {
+                println!("sending {}", item);
+                *target2.lock().unwrap() = Some(item);
+                yield_now().await;
+            }
+        }.boxed_local();
+        let mut done = false;
+        futures::stream::poll_fn(move |ctx| {
+            if done {
+                return Poll::Ready(None)
+            }
+            match fut.poll_unpin(ctx) {
+                Poll::Pending => {
+                    println!("got pending");
+                    if let Some(item) = target.lock().unwrap().take() {
+                        Poll::Ready(Some(item))
+                    } else {
+                        Poll::Pending
+                    }
+                }
+                Poll::Ready(_) => {
+                    println!("got ready");
+                    done = true;
+                    if let Some(item) = target.lock().unwrap().take() {
+                        Poll::Ready(Some(item))
+                    } else {
+                        Poll::Ready(None)
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_foo() {
+        let stream = foo2(1);
+        assert_eq!(stream.collect::<Vec<_>>().await, vec![]);
+    }
+
+    // #[tokio::test]
+    // async fn test3() {
+    //     let db = Database;
+    //     let q = Query;
+    //     let stream = mk_ls2((db, q), |(db, q)| db.query(q));
+    //     assert_eq!(stream.collect::<Vec<_>>().await, vec!["1", "2", "3"]);
+    // }
+}
+
+fn foo<'a>(arg: &'a mut u64) -> impl Stream<Item = u64> + 'a {
+    futures::stream::empty()
+}
+
+async fn drain_stream<V, F: Fn(&mut V) -> S + 'static, S: Stream + Unpin + 'static>(mut value: V, mk_stream: F, target: Arc<Mutex<Option<S::Item>>>) {
+    let mut stream = mk_stream(&mut value);
+    while let Some(item) = stream.next().await {
+        *target.lock().unwrap() = Some(item);
+    }
+}
+
+struct LiveStream2<F, I> {
+    fut: F,
+    item: Arc<Mutex<Option<I>>>,
+}
+
+// impl<F: Future<Output=()>,I> Stream for LiveStream2<F, I> {
+//     type Item = I;
+//     fn poll_next(
+//         mut self: Pin<&mut Self>,
+//         cx: &mut Context<'_>,
+//     ) -> Poll<Option<Self::Item>> {
+//         match Pin::new(&mut self.fut).poll(cx) {
+//             Poll::Pending => {
+//                 if let Some(item) = self.item.lock().unwrap().take() {
+//                     Poll::Ready(Some(item))
+//                 } else {
+//                     Poll::Pending
+//                 }
+//             }
+//             Poll::Ready(_) => {
+//                 if let Some(item) = self.item.lock().unwrap().take() {
+//                     Poll::Ready(Some(item))
+//                 } else {
+//                     Poll::Ready(None)
+//                 }
+//             }
+//         }
+//     }
+// }
+
+// fn mk_ls2<'a, V, S: Stream + Unpin, F: Fn(&mut V) -> S>(value: V, f: F) -> impl Stream<Item = S::Item> {
+//     let item = Arc::new(Mutex::new(None));
+//     let fut = drain_stream(value, f, item.clone());
+//     LiveStream2 {
+//         fut,
+//         item,
+//     }
+// }
+
+pub async fn yield_now() {
+    YieldNow(false).await
+}
+
+struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+
+    // The futures executor is implemented as a FIFO queue, so all this future
+    // does is re-schedule the future back to the end of the queue, giving room
+    // for other futures to progress.
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.0 {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
     }
 }
