@@ -186,6 +186,7 @@ name = "live_stream"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "pin-project",
  "pin-utils",
  "tokio",
 ]
